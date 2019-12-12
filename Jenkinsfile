@@ -21,9 +21,31 @@ properties(projectProperties)
 Common common = new Common(this)
 BuildsCommon buildsCommon = new BuildsCommon(this)
 
+GitHub github = new GitHub()
+String RELEASE_BRANCH = "master"
+
+// This is an extra security to avaoid pushes (even from master) until we are ready
+Boolean relpush = false
+
+def push = env.BRANCH_NAME == RELEASE_BRANCH && relpush ? "push" : ""
+
 try {
     node(Constants.DOCKERNODE) {
         buildsCommon.cleanup()
+
+        // We check and see if the release is not yet used
+        stage("prepare release") {
+            Boolean fail = push ? true : false
+
+            def SCM = checkout scm
+
+            // get version number from build.gradle
+            String ver = sh (script: './gradlew properties | grep ^version: | awk \'{ print $2 }\'', returnStdout: true).trim()
+
+            if (github.checkRelease(ver, SCM, fail)) {
+                echo "Warning: Tag ${ver} already exists!"
+            }
+        }
 
         stage('scm auto') {
             dir('automation') {
@@ -84,11 +106,9 @@ try {
                             sh '''
                             find .
                             cat ./tenableio-sdk/tio_config.txt | sed 's/^/systemProp./g' > gradle.properties
-
-                            cat gradle.properties
-
+    
                             chmod +x gradlew
-                            ./gradlew build
+                            ./gradlew build 
                             '''.stripIndent()
                         }
                     }
@@ -96,10 +116,42 @@ try {
                         step([$class: 'JUnitResultArchiver', testResults: 'build/test-results/test/*.xml'])
                     }
                 }
+
+                stage("publish package") {
+                    if (push) {
+                        buildsCommon.manualGate(bparams, "Ready for publishing to Maven Central?")
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'MAVENCREDS',
+                                          usernameVariable: 'MVNUSR', passwordVariable: 'MVNPWD']]) {
+                            sh '''
+                            echo "deployMavenUsername=${MVNUSR}" > gradle.properties
+                            echo "deployMavenPassword=${MVNPWD}" > gradle.properties
+                            eche "signing.keyId=${KEYID}" > gradle.properties
+                            echo "signing.password=${KEYPWD}" > gradle.properties
+                            echo "signing.secretKeyRingFile=${KEYPATH}" > gradle.properties
+                        
+                            gradle publish
+                            '''.stripIndent()
+                        }
+                    }
+                }
             }
         }
 
         common.setResultIfNotSet(Constants.JSUCCESS)
+    }
+    if (push) {
+        node(global.DOCKERNODE) {
+            common.cleanup()
+
+            stage("tag github repo") {
+                def SCM = checkout scm
+
+                // get version number from build.gradle
+                String ver = sh (script: './gradlew properties | grep ^version: | awk \'{ print $2 }\'', returnStdout: true).trim()
+
+                github.createRelease(ver, SCM)
+            }
+        }
     }
 }
 catch (ex) {
